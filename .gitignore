@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Simulation output (regenerate with the commands in the README)
+state*.json
+ensemble*.json
+variedade*.json
+busca*.json
+enredo_*.txt
+dossie_*.txt
+oficial_*.json
+proposta_*.json
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

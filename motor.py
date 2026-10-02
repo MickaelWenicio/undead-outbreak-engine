@@ -396,13 +396,323 @@ class Mundo:
         self.checar_fim()
 
     # ------------------------------------------------------------------ origem
+    def navio(self):
+        self.flags["navio"] = self.h
+        L = self.L[M.ORIGEM]
+        mar = []
+        for i in range(3):
+            p = self.nova_pessoa(L.id, -1, "", "m", int(self.rng.integers(20, 50)), "estrangeiro",
+                                 nome=self.escolhe(M.NOMES_ESTRANGEIROS))
+            p.sob = ""
+            self.morder(p, L.id, conta=False)
+            p.esconde, p.abrigo = False, True
+            mar.append(p)
+        quando = self.h + int(self.rng.integers(3, 8))
+        for i in range(6):
+            z = self.nova_pessoa(None, -1, "", "m", int(self.rng.integers(20, 50)), "estrangeiro",
+                                 nome=self.escolhe(M.NOMES_ESTRANGEIROS))
+            z.sob, z.estado, z.loc = "", ZUMBI, L.id
+            self.porao.append((quando, z.id))
+        self.ev("navio", L.id, mar, f"Na noite do dia {self.dia()}, um navio sem bandeira bate nas pedras de {L.nome}. "
+                f"Três marinheiros feridos chegam à praia pedindo ajuda numa língua que ninguém entende. "
+                f"Os pescadores levam os três para dentro de casa. No porão, alguma coisa bate contra as tábuas.")
+
+    def solta_porao(self):
+        if not self.porao:
+            return
+        prontos = [z for h, z in self.porao if h <= self.h]
+        if prontos:
+            self.porao = [(h, z) for h, z in self.porao if h > self.h]
+            L = self.L[M.ORIGEM]
+            for zid in prontos:
+                self.Zin[L.id].add(zid)
+            self.ev("porao", L.id, [], f"De madrugada, as tábuas do porão cedem. {len(prontos)} homens saem do navio "
+                    f"correndo pela praia de {L.nome}, direto para as casas.", n=len(prontos))
+
+    # ------------------------------------------------------------------ mordida, morte, virada, levante
+    def alimenta(self, lid, quanto):
+        """Comida dos mortos de um lugar no dia; repartida entre eles no apodrecer()."""
+        if lid in self.L:
+            pool = self.flags.setdefault("comida_z", {})
+            pool[lid] = pool.get(lid, 0.0) + quanto
+
+    def morder(self, p, lid, conta=True):
+        if p.estado == MORDIDO:
+            return
+        self.alimenta(lid, C.COMIDA_MORDIDA)
+        p.estado = MORDIDO
+        self.mordidos.add(p.id)
+        p.t_vira = self.h + float(self.rng.triangular(C.VIRA_MORDIDO_H[0], C.VIRA_MORDIDO_MODA, C.VIRA_MORDIDO_H[1]))
+        p.esconde = None
+        self.seq += 1
+        heapq.heappush(self.timers, (math.ceil(p.t_vira), self.seq, "vira", p.id))
+        if conta:
+            self.contas["mordidos"] += 1
+
+    def morrer(self, p, causa, lid, levanta_chance=0.0, destino=None):
+        """Tira p dos vivos. Se o corpo ficou inteiro (levanta_chance), ele levanta em 10 a 60 minutos: no lugar
+        (registro de corpo, que os vivos ainda podem destruir) ou, na estrada e fora do muro, direto no bando (destino)."""
+        if p.loc is not None:
+            self.H[p.loc].discard(p.id)
+            self.Fora[p.loc].discard(p.id)
+        if p.viagem is not None:
+            self.sair_do_grupo(p)
+        self.mordidos.discard(p.id)
+        if causa in C.COMIDO:
+            self.alimenta(lid, 1.0)
+        if (p.papel == "rei" or (p.titulo in ("Rei", "Rainha") and p.papel != "rainha")) and p.estado in VIVOS:
+            onde = self.L[lid].nome if lid in self.L else "na estrada"
+            self.ev("rei_morre", lid if lid in self.L else None, [p],
+                    f"{self.nm(p)} morre {('em ' + onde) if lid in self.L else onde}: {causa}.", causa=causa)
+        p.estado, p.morte, p.causa = MORTO, self.h, causa
+        p.abrigo = p.cela = False
+        self.contas["mortos"] += 1
+        if levanta_chance > 0 and self.r() < levanta_chance:
+            if destino is not None:
+                p.estado = ZUMBI
+                self.contas["levantaram"] += 1
+                destino(p)
+            elif lid is not None:
+                self.corpos.append({"id": p.id, "lugar": lid, "h": self.h + 1})
+        self.passa_o_fio(p)
+
+    def destruir(self, z, causa):
+        for lid in (z.loc,):
+            if lid is not None:
+                self.Zin[lid].discard(z.id)
+                self.Zout[lid].discard(z.id)
+        z.estado, z.causa = DESTRUIDO, causa
+        if z.morte is None:
+            z.morte = self.h
+        self.contas["destruidos"] += 1
+        self.flags["ultima_baixa_z"] = causa
+
+    def transformar(self, p, onde_txt=None):
+        if (p.papel == "rei" or (p.titulo in ("Rei", "Rainha") and p.papel != "rainha")) and p.estado in VIVOS:
+            onde = self.L[p.loc].nome if p.loc in self.L else "na estrada"
+            self.ev("rei_morre", p.loc if p.loc in self.L else None, [p],
+                    f"{self.nm(p)} se levanta morto {('em ' + onde) if p.loc in self.L else onde}. O reino fica sem rei.")
+        self.mordidos.discard(p.id)
+        lid = p.loc
+        if lid is not None and p.id in self.Fora[lid]:
+            self.Fora[lid].discard(p.id)
+            p.estado, p.t_vira = ZUMBI, None
+            p.morte = p.morte if p.morte is not None else self.h
+            self.Zout[lid].add(p.id)
+            return
+        if p.viagem is not None:
+            g = self.grupo(p.viagem)
+            self.sair_do_grupo(p)
+            p.estado, p.morte, p.t_vira = ZUMBI, p.morte if p.morte is not None else self.h, None
+            if g:
+                p.loc = None
+                self.virou_na_estrada(p, g)
+            return
+        if lid is None:
+            return
+        self.H[lid].discard(p.id)
+        L = self.L[lid]
+        p.estado, p.t_vira = ZUMBI, None
+        if p.morte is None:
+            p.morte = self.h
+        p.causa = p.causa or "virou morto-vivo"
+        if p.suspeito >= self.h and L.pol.get("caserna"):
+            p.cela = True     # dormia na caserna trancada com os outros que lutaram
+        if p.cela:
+            p.cela = False
+            if self.r() < 0.85:
+                self.destruir(p, "abatido na cela ao virar")
+                self.contas["cela"] += 1
+                if "mordida" not in L.sabe:
+                    self.aprender(L, "mordida", f"Em {L.nome}, um mordido preso na cela vira morto-vivo. Agora todos sabem "
+                                                f"o que a mordida faz.")
+                return
+        self.Zin[lid].add(p.id)
+        escondia = bool(p.esconde)
+        self.contas["virou_dentro" if escondia else "virou"] += 1
+        if self.vivos_em(lid):
+            if "mordida" not in L.sabe:
+                self.aprender(L, "mordida", f"Em {L.nome}, {self.nm(p)} se levanta morto no meio da própria família. "
+                                            f"Ninguém sabia que a mordida fazia isso.", [p])
+            if p.abrigo:     # virou dentro de uma casa fechada: a casa vira armadilha
+                vizinhos = [q for q in self.vivos_em(lid) if q.abrigo][:C.GENTE_POR_CASA]
+                for q in vizinhos:
+                    q.abrigo = False
+            if escondia and (p.holofote or self.contas["virou_dentro"] <= 3 or L.tipo in FORTES):
+                self.ev("virou_dentro", lid, [p], f"Em {L.nome}, {self.nm(p)} se levanta morto. "
+                        f"Tinha escondido a mordida.", motivo="mordida escondida")
+            if escondia:
+                self.medidas_contra_escondidos(L, p)
+        p.abrigo = False
+
     def cidade(self, L):
         return [self.L[b] for b in sorted(M.CAPITAL)] if L.id in M.CAPITAL else [L]
+
+    def mortos_agem(self):
+        for lid in sorted(self.L):
+            if self.Zout[lid]:
+                if self.H[lid]:
+                    self.cerco(lid)
+                else:
+                    self.Zin[lid] |= self.Zout[lid]
+                    self.Zout[lid].clear()
+            if self.Zin[lid]:
+                visiveis = any(not self.P[i].escondido for i in self.H[lid])
+                if visiveis:
+                    self.ataque_dentro(lid)
+                else:
+                    if self.H[lid]:
+                        self.procurar_escondidos(self.L[lid], self.vivos_em(lid))
+                    self.marcar_queda(lid)
+                    self.partir(lid)
+
+    def marcar_queda(self, lid):
+        L = self.L[lid]
+        if L.estado not in ("caida", "vazia") and L.caiu is None and L.invadida_em is not None:
+            # um lugar que já estava vazio (todos tinham saído ou morrido antes) não "cai": só fica vazio
+            recente = [d["lugares"].get(lid, [0, 0])[0] for d in self.diario[-3:]]
+            if not self.H[lid] and recente and not any(recente):
+                L.estado = "vazia"
+                return
+            L.estado, L.caiu = "caida", self.h
+            self.ev("queda", lid, [], f"{L.nome} cai. Não sobra ninguém vivo lá dentro, só os mortos.",
+                    zumbis=len(self.Zin[lid]))
+
+    def barulho(self, L, intensidade):
+        """Briga, grito, pancada no portão, sino, fogo: quanto mais alto, de mais longe chama os mortos."""
+        if self.h - L.barulho > 3:
+            L.ruido = 0.0
+        L.barulho = self.h
+        L.ruido = min(C.RUIDO_MAX, max(L.ruido, intensidade))
+
+    def alvo_por_cheiro(self, lid):
+        L = self.L[lid]
+        best, bs = None, 0.0
+        for T in self.L.values():
+            gente = sum(1 for i in self.H[T.id] if not self.P[i].escondido and self.P[i].cheiro < self.h) + len(self.Fora[T.id])
+            if T.id == lid:
+                continue
+            d = math.hypot(T.x - L.x, T.y - L.y)
+            ruido = T.ruido if self.h - T.barulho <= 3 else 0.0
+            raio_cheiro = C.CHEIRO_KM * (1.4 if self.nivel >= 3 else 1.0)
+            raio_ruido = C.RUIDO_KM_POR_PONTO * ruido
+            if not ((gente and d <= raio_cheiro) or (ruido and d <= raio_ruido)):
+                continue
+            s = (math.sqrt(gente) if d <= raio_cheiro else 0) + ruido * 0.8
+            s = s / (1 + d) ** 1.3
+            if s > bs:
+                best, bs = T.id, s
+        return best
+
+    def partir(self, lid):
+        if self.geada and self.estacao() == "inverno":
+            return
+        zs = sorted(self.Zin[lid])
+        if not zs:
+            return
+        alvo = self.alvo_por_cheiro(lid)
+        if alvo is None:
+            # sem cheiro nem ruído: parte do bando sai vagando pela ilha; pode achar alguém, ou não
+            if self.r() > C.VAGA_HORA or not self.adj[lid]:
+                return       # no ilhéu não há estrada: os mortos ficam presos lá
+            nb, km, tipo = self.escolhe(self.adj[lid])
+            vao = [z for z in zs if self.r() < C.VAGA_FRACAO]
+            if not vao:
+                return
+            for z in vao:
+                self.Zin[lid].discard(z)
+                self.P[z].loc = None
+            self.hordas.append({"id": self.novo_id(), "ids": vao, "de": lid, "para": nb, "km": km, "feito": 0.0,
+                                "vel": C.VEL_ZUMBI_VAGA, "parada": False, "vagando": True})
+            return
+        else:
+            if self.r() > min(0.95, C.SAIDA_BASE + 0.15 * self.nivel + 0.4):
+                return
+            nb = self.proximo(lid, alvo)
+            km, tipo = self.aresta(lid, nb)
+            vel = C.VEL_ZUMBI_CAÇA if self.km(lid, alvo) <= C.CHEIRO_KM * 1.5 else C.VEL_ZUMBI_VAGA * 2
+        if nb is None:
+            return
+        vao = [z for z in zs if self.r() < C.SEGUE_BANDO]
+        if not vao:
+            return
+        for z in vao:
+            self.Zin[lid].discard(z)
+            self.P[z].loc = None
+        self.hordas.append({"id": self.novo_id(), "ids": vao, "de": lid, "para": nb, "km": km, "feito": 0.0,
+                            "vel": vel, "parada": False})
 
     def novo_id(self):
         self.gid += 1
         return self.gid
 
+    def andar_hordas(self):
+        fica, atual = [], self.hordas
+        self.hordas = []
+        for hd in atual:
+            hd["ids"] = [i for i in hd["ids"] if self.P[i].estado == ZUMBI]
+            if not hd["ids"]:
+                continue
+            if hd.get("parada"):
+                if self.h - hd.get("desde", self.h) > 24 * 5:   # emboscada desiste depois de uns dias
+                    hd["parada"] = False
+                else:
+                    for g in list(self.grupos):
+                        if {g["de"], g["para"]} == {hd["de"], hd["para"]} and g["m"] and self.r() < 0.8:
+                            self.encontro(g, hd)
+                    hd["ids"] = [i for i in hd["ids"] if self.P[i].estado == ZUMBI]
+                    if hd["ids"]:
+                        fica.append(hd)
+                    continue
+            hd["feito"] += hd["vel"]
+            for g in self.grupos:
+                if g.get("acabou") or {g["de"], g["para"]} != {hd["de"], hd["para"]}:
+                    continue
+                pos_g = g["feito"] if g["de"] == hd["de"] else g["km"] - g["feito"]
+                if abs(pos_g - hd["feito"]) <= hd["vel"] + g["vel"]:
+                    self.encontro(g, hd)
+            hd["ids"] = [i for i in hd["ids"] if self.P[i].estado == ZUMBI]
+            if not hd["ids"]:
+                continue
+            if hd["feito"] >= hd["km"]:
+                self.chegada_horda(hd)
+            else:
+                fica.append(hd)
+        self.hordas = fica + self.hordas      # as emboscadas criadas nesta hora entram no fim
+
+    def chegada_horda(self, hd):
+        dest = hd["para"]
+        L = self.L[dest]
+        km, tipo = self.aresta(hd["de"], dest)
+        externo = tipo != "rua"
+        for i in hd["ids"]:
+            self.P[i].loc = dest
+        if tipo == "rua" and self.H[dest] and L.barricada_rua > 0 and not self.Zin[dest]:
+            self.Zout[dest] |= set(hd["ids"])
+            L.cerco_rua = True
+            return
+        if self.H[dest] and L.muro > 0 and externo and L.portao_hp > 0 and L.estado != "invadida":
+            self.Zout[dest] |= set(hd["ids"])
+            if L.alerta is None:
+                self.aprender(L, "mortos", f"Os vigias de {L.nome} veem um bando correndo pela estrada, direto para o portão.")
+        else:
+            self.Zin[dest] |= set(hd["ids"])
+            if not self.H[dest] and self.nivel >= 3 and self.r() < C.EMBOSCADA[self.nivel]:
+                # lugar vazio: parte do bando fica esperando na estrada de saída
+                viz = [nb for nb, _, t in self.adj[dest] if t == "estrada"]
+                if viz:
+                    nb = self.escolhe(viz)
+                    km2, _ = self.aresta(dest, nb)
+                    ids = [i for i in hd["ids"] if self.r() < 0.6]
+                    if ids:
+                        for i in ids:
+                            self.Zin[dest].discard(i)
+                            self.P[i].loc = None
+                        self.hordas.append({"id": self.novo_id(), "ids": ids, "de": dest, "para": nb, "km": km2,
+                                            "feito": km2 * 0.3, "vel": C.VEL_ZUMBI_CAÇA, "parada": True,
+                                            "desde": self.h})
+
+    # ------------------------------------------------------------------ grupos de vivos na estrada
     def novo_dia(self):
         est = self.estacao()
         self.geada = self.r() < (C.FROST_INVERNO if est == "inverno" else C.FROST_OUTONO if est == "outono" else 0)
@@ -422,6 +732,69 @@ class Mundo:
         self.intrigas()
         self.diario.append({"dia": self.dia(), "lugares": {l: [len(self.H[l]), len(self.Zin[l]) + len(self.Zout[l])]
                                                          for l in self.L if self.H[l] or self.Zin[l] or self.Zout[l]}})
+
+    def apodrecer(self):
+        """O prazo de cada morto-vivo. Comida reparte o ganho entre os mortos do lugar; o inverno conserva."""
+        if self.flags.get("navio") is None:
+            return
+        pool = self.flags.get("comida_z", {})
+        for lid in sorted(pool):
+            zs = sorted(self.Zin[lid] | self.Zout[lid])
+            if zs and pool[lid] > 0:
+                ganho = min(C.PODRE_GANHO_MAX_DIA, pool[lid] / len(zs) * C.PODRE_POR_VITIMA) * 24
+                for i in zs:
+                    z = self.P[i]
+                    if z.zfim is not None:
+                        z.zfim += ganho
+        self.flags["comida_z"] = {}
+        inverno = self.estacao() == "inverno"
+        ids = sorted(set().union(*self.Zin.values(), *self.Zout.values(), *[set(h["ids"]) for h in self.hordas]))
+        caem = collections.Counter()
+        for i in ids:
+            z = self.P[i]
+            if z.estado != ZUMBI:
+                continue
+            if z.zfim is None:
+                a, moda, b = C.PODRIDAO_DIAS
+                z.zfim = (z.morte if z.morte is not None else self.h) + float(self.rng.triangular(a, moda, b)) * 24
+            if inverno:
+                z.zfim += 12          # no frio o corpo conserva: o prazo anda pela metade
+            if z.zfim <= self.h:
+                onde = z.loc
+                if onde is None:
+                    for h in self.hordas:
+                        if i in h["ids"]:
+                            h["ids"].remove(i)
+                            onde = h["para"]
+                            break
+                self.destruir(z, "apodreceu de vez")
+                self.contas["apodreceram"] += 1
+                caem[onde] += 1
+        n = sum(caem.values())
+        if not n:
+            return
+        if not self.flags.get("podre_primeiro"):
+            self.flags["podre_primeiro"] = self.h
+            dias = (self.h - self.flags["navio"]) // 24
+            self.ev("apodrece", None, [], f"{dias} dias depois do navio, os mortos-vivos começam a cair sozinhos. A pele "
+                    f"solta dos ossos, as pernas não sustentam mais o corpo. {self.pessoas(n, 'morto cai', 'mortos caem')} "
+                    f"hoje e não se levanta{'m' if n > 1 else ''} mais.", n=n)
+            self.flags["podre_base"] = len(ids)
+            return
+        # marcos: metade caiu, um quarto de pé, cem de pé, dez de pé, nenhum de pé (contando também os destruídos)
+        resta = len(ids) - n
+        base_n = self.flags.get("podre_base", len(ids))
+        feitos = self.flags.setdefault("podre_marcos", [])
+        for marco, limite, txt in (("metade", base_n // 2, "Metade dos mortos que andavam quando a podridão começou já caiu."),
+                                   ("quarto", base_n // 4, "Só um quarto dos mortos ainda anda."),
+                                   ("cem", 100, "Restam menos de cem mortos-vivos de pé em toda a ilha."),
+                                   ("dez", 10, "Restam menos de dez mortos-vivos de pé em toda a ilha.")):
+            if marco not in feitos and resta < limite:
+                feitos.append(marco)
+                lugares = ", ".join(self.L[l].nome for l, _ in caem.most_common(2) if l in self.L)
+                self.ev("apodrece", None, [], f"{txt} Hoje {'cai mais um' if n == 1 else f'caem mais {n}'}, podres"
+                        + (f", a maior parte em {lugares}" if lugares else "") + f". Restam {resta}.", n=n, resta=resta,
+                        marco=marco)
 
     def registrar(self):
         vivos = sum(len(s) for s in self.H.values()) + sum(len(g["m"]) for g in self.grupos) + \

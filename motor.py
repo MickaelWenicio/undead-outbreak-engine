@@ -585,6 +585,354 @@ class Mundo:
         L.barulho = self.h
         L.ruido = min(C.RUIDO_MAX, max(L.ruido, intensidade))
 
+    def nivel_porta(self):
+        return C.PORTA_APRENDE[self.nivel]
+
+    def cerco(self, lid):
+        L = self.L[lid]
+        if self.Fora[lid]:      # quem acampou do lado de fora é o primeiro a ser pego
+            fora = [self.P[i] for i in sorted(self.Fora[lid])]
+            zs0 = [self.P[i] for i in self.amostra(sorted(self.Zout[lid]), max(1, len(fora)))]
+            res = self.luta_aberta(fora, zs0, L, "acampamento", destino=lambda q: self.Zout[lid].add(q.id))
+            if res["mortos"] + res["mordidos"] >= 3:
+                self.ev("acampamento", lid, [], f"Do lado de fora do portão fechado de {L.nome}, os mortos alcançam os que "
+                        f"esperavam para entrar. {self.resumo_luta(res)}", **{k: v for k, v in res.items() if k != "herois"})
+        I.no_cerco(self, L, [p for p in self.vivos_em(lid) if p.classe >= 2 and p.estado == VIVO and not p.cela])
+        zs = sorted(self.Zout[lid])
+        n = len(zs)
+        if n == 0:
+            return
+        hp, limiar, nome_muro = C.MURO[L.muro]
+        if "fosso" in L.ideias:
+            limiar = int(limiar * 1.5)
+        if L.cerco_rua:
+            hp, limiar, nome_muro = C.BARRICADA_RUA, C.BARRICADA_RUA_ESCALA, "barricada da rua"
+        vivos = self.vivos_em(lid)
+        armados = [p for p in vivos if p.classe >= 2 and not p.cela and p.estado == VIVO]
+        defensores = [p for p in armados if self.r() < C.TURNO_NO_MURO]
+        if L.alerta is None:
+            self.aprender(L, "mortos", f"Em {L.nome}, os vigias veem gente correndo para o muro. Não são vivos.")
+        self.barulho(L, 1 + len(self.Zout[lid]) / 25)
+        fator = 1.0 if "cabeca" in L.sabe else 0.6
+        k = int(self.rng.binomial(len(defensores), min(0.9, C.MATA_DO_MURO * fator))) if defensores else 0
+        for zid in self.amostra(zs, k):
+            self.destruir(self.P[zid], f"derrubado do alto do {nome_muro}")
+        escalando = self.nivel >= 2 and n >= limiar * 0.5
+        if escalando and defensores:
+            nm = int(self.rng.binomial(len(defensores), C.MORDIDA_NO_MURO * min(3.0, n / max(1, limiar))))
+            for p in self.amostra(defensores, nm):
+                self.morder(p, lid)
+        n = len(self.Zout[lid])
+        if n == 0:
+            return
+        empurram = min(n, C.EMPURRAM[L.muro if not L.cerco_rua else 1])
+        if L.cerco_rua:
+            L.barricada_rua -= empurram * (1.5 if self.nivel >= 4 else 1.0) * 0.6
+            rompeu = L.barricada_rua <= 0
+        else:
+            L.portao_hp -= empurram * (1.5 if self.nivel >= 4 else 1.0) * C.MURO_DANO[L.muro]
+            rompeu = L.portao_hp <= 0
+        mult = C.ESCALA_POR_DEFENSOR[1 if L.cerco_rua else L.muro]
+        if not rompeu and self.nivel >= 2 and n >= limiar and n >= mult * max(1, len(defensores)):
+            if self.r() < min(0.6, 0.05 + 0.3 * (n / limiar - 1)):
+                rompeu = "escalada"
+        if not rompeu and L.pol.get("defender") and armados and n <= 0.35 * len(armados):
+            ld = self.lider(L)
+            if ld and ld.a["coragem"] >= 5:
+                res = self.luta_aberta(armados, [self.P[i] for i in sorted(self.Zout[lid])], L, "surtida")
+                ja = self.flags.setdefault("surtidas", {})
+                ja[lid] = ja.get(lid, 0) + 1
+                # a primeira saída de cada lugar entra no log; as rotineiras, só se forem grandes ou custarem gente
+                if ja[lid] == 1 or n >= 10 or res["mortos"] + res["mordidos"] >= 2:
+                    self.ev("surtida", lid, [ld], f"{self.nm(ld)} abre os portões de {L.nome} e sai com "
+                            f"{len(armados)} armados contra {'o único morto' if n == 1 else f'os {n} mortos'} do lado de fora. "
+                            f"{self.resumo_luta(res)}", z0=n, **res)
+                return
+        if rompeu == True and not L.cerco_rua and armados and len(armados) >= 8 and self.r() < 0.5 and not L.escorado:
+            # o portão está cedendo: os armados jogam o corpo contra ele, e as mãos passam pelas frestas
+            ld = self.lider(L)
+            escora = self.amostra(armados, min(len(armados), 30))
+            L.portao_hp = 25.0 * len(escora) / 10
+            L.escorado = True
+            mord = self.amostra(escora, int(self.rng.binomial(len(escora), 0.12)))
+            for q in mord:
+                self.morder(q, lid)
+            self.ev("escora", lid, [ld], f"O portão de {L.nome} começa a ceder. {len(escora)} homens jogam o corpo contra as "
+                    f"tábuas para segurar. Pelas frestas, as mãos dos mortos alcançam {self.pessoas(len(mord), 'deles', 'deles')}.",
+                    motivo="o portão cedendo", n=len(escora), mordidos=len(mord))
+            rompeu = False
+        if rompeu:
+            como = "escalam o " + nome_muro if rompeu == "escalada" else "derrubam o portão"
+            self.Zin[lid] |= self.Zout[lid]
+            self.Zout[lid].clear()
+            if L.cerco_rua:
+                L.barricada_rua, L.cerco_rua = 0.0, False
+            else:
+                L.portao_hp = 0
+            L.invadida_em = L.invadida_em or self.h
+            L.estado = "invadida"
+            self.ev("invasao", lid, [], f"Os mortos {como} de {L.nome}. São {n} do lado de dentro.", z0=n)
+
+    def ataque_dentro(self, lid):
+        L = self.L[lid]
+        zs = [self.P[i] for i in sorted(self.Zin[lid])]
+        vivos = self.vivos_em(lid)
+        if L.pol.get("defender") and L.tipo in ("vila", "bairro", "cidadela", "castelo"):
+            for p in vivos:
+                if p.abrigo and p.estado == VIVO and p.classe >= 2 and self.r() < C.RESPOSTA_ARMADA:
+                    p.abrigo = False
+        if L.invadida_em is None:
+            L.invadida_em = self.h
+            L.estado = "invadida"
+        if "mortos" not in L.sabe:
+            self.aprender(L, "mortos", f"Em {L.nome}, gente morta ataca os vizinhos no meio da rua.")
+        L.medo = min(100, L.medo + 15)
+        self.procurar_escondidos(L, vivos)
+        vivos = [p for p in vivos if p.estado in VIVOS]
+        expostos = [p for p in vivos if not p.abrigo and not p.cela and not p.escondido]
+        confusos = "mordida" not in L.sabe    # sem saber o que é, os vizinhos acodem em vez de correr
+        lutam = [p for p in expostos if p.classe >= 3 or (p.classe >= 1 and (self.enfrenta(p, L) or confusos))]
+        self.formar(L, lutam)
+        civis = [p for p in expostos if p not in set(lutam)]
+        Z = len(zs)
+        alcance = Z if L.tipo in ("aldeia", "mosteiro", "mina") else max(1, int(round(Z * C.CONTATO_ABERTO)))
+        ativos = self.amostra(zs, alcance)
+        res = {"z_mortos": 0, "mortos": 0, "mordidos": 0, "herois": []}
+        livres = list(ativos)
+        if lutam and ativos:
+            ne = min(len(ativos), len(lutam))
+            engajados, livres = ativos[:ne], ativos[ne:]
+            times = [[] for _ in range(ne)]
+            for i, p in enumerate(self.amostra(lutam, len(lutam))):
+                if i < ne * 4:
+                    times[i % ne].append(p)
+            for z, time in zip(engajados, times):
+                self.luta_time(time, z, L, res, len(zs))
+        alvos = [p for p in civis if p.estado == VIVO]
+        multidao = min(3, max(0, Z // max(1, len(vivos))))
+        if not expostos and L.casas - L.quebradas <= 0:
+            for p in vivos:              # não sobrou porta inteira: quem estava trancado fica à vista
+                p.abrigo = p.cela = False
+            expostos = list(vivos)
+        if not expostos and not [p for p in vivos if p.abrigo or p.cela]:
+            return
+        if L.reduto_nome is None or L.reduto_hp <= 0:
+            for p in vivos:              # sem reduto de pé, a marca de reduto não protege ninguém
+                p.reduto = False
+        self.talvez_reduto(L, vivos, lutam, Z)
+        alvos = [p for p in alvos if not p.reduto and not p.escondido]
+        batendo = []
+        for z in livres:
+            if z.estado != ZUMBI:
+                continue
+            if alvos:
+                nv = int(self.rng.poisson(C.VITIMAS_POR_HORA))
+                for v in self.amostra(alvos, nv):
+                    self.atacado(v, L, res, multidao)
+                    alvos.remove(v)
+            else:
+                L.dano_portas += self.nivel_porta()
+                batendo.append(z)
+        self.quebrar_portas(L, res, batendo)
+        L.lutas += len(lutam) and 1
+        if L.lutas >= 6 and "cabeca" not in L.sabe:
+            self.aprender(L, "cabeca", f"Em {L.nome}, os que lutam aprendem do jeito mais duro: braço cortado não para "
+                                       f"um morto. Só a cabeça.")
+        self.barulho(L, 2 + (res["mortos"] + res["mordidos"] + res["z_mortos"]) / 3 + Z / 15)
+        if res["mortos"] + res["mordidos"] + res["z_mortos"] >= 4 or res["herois"]:
+            self.ev("ataque", lid, res["herois"], f"Em {L.nome}, {self.pessoas(Z, 'morto-vivo', 'mortos-vivos')} "
+                    f"dentro do lugar. {self.resumo_luta(res)}", z0=Z, h0=len(vivos), **{k: v for k, v in res.items()
+                                                                                         if k != "herois"})
+
+    def luta_time(self, time, z, L, res, multidao_total, destino=None):
+        """Um time de 1 a 4 vivos contra um morto, rodada a rodada, até um lado cair. O morto não recua.
+        Força pesa no golpe; soldados em formação (escudo com escudo) levam menos mordidas e derrubam mais."""
+        fator = 1.0 if (L is None or "cabeca" in L.sabe) else 0.6
+        form = L is not None and L.formacao and any(q.classe >= 3 for q in time)
+        for q in time:
+            q.suspeito = self.h + 24
+        if form:
+            fator *= C.FORMACAO_MATA
+        vivos = [p for p in time if p.estado in VIVOS]
+        for _ in range(40):
+            if not vivos or z.estado != ZUMBI:
+                break
+            pk = 1.0
+            for p in vivos:
+                pk *= 1 - min(0.9, C.P_MATA[p.classe] * fator * (0.7 + p.a.get("forca", 5) / 15))
+            pk = 1 - pk
+            alvo = vivos[0]
+            pb = C.P_MORDE * C.ARMADURA[alvo.classe] * (C.AJUDA_SEGURA ** (len(vivos) - 1)) * (C.FORMACAO_MORDE if form else 1)
+            mata, morde = self.r() < pk, self.r() < pb
+            if morde:
+                multidao = min(3, max(0, multidao_total // 6))
+                if self.r() < C.MORTE_NA_HORA[multidao] * 0.6:
+                    self.morrer(alvo, "morto lutando contra os mortos", L.id if L else None,
+                                C.CORPO_INTEIRO[min(3, multidao)], destino)
+                    res["mortos"] += 1
+                else:
+                    self.morder(alvo, L.id if L else None)
+                    res["mordidos"] += 1
+                vivos = [p for p in vivos if p.estado == VIVO]
+                if vivos and max(q.classe for q in vivos) <= 2:
+                    vivos = [q for q in vivos if self.r() > C.DEBANDA]
+                    if not vivos:
+                        break         # todo mundo correu: o morto continua de pé
+            if mata:
+                self.destruir(z, "destruído em luta")
+                res["z_mortos"] += 1
+                if len(time) == 1 and time[0].estado in VIVOS and self.r() < 0.04:
+                    res["herois"].append(time[0])
+                break
+
+    def enfrenta(self, p, L, base=9):
+        """Lutar ou correr: coragem e força contra o medo. Armado ajuda; defender a família também."""
+        nota = p.a["coragem"] + p.a.get("forca", 5) / 2 + (1.5 if p.classe >= 2 else 0) - (L.medo / 40 if L else 0)
+        if L is not None and L.pol.get("defender") and p.classe >= 2:
+            nota += 2
+        return nota + self.r() * 2 >= base
+
+    def formar(self, L, lutam):
+        """Com um oficial e pelo menos seis soldados, eles se formam em linha. Nem sempre alguém pensa nisso."""
+        if L.formacao or L.tipo not in ("vila", "bairro", "cidadela", "castelo"):
+            return
+        soldados = [p for p in lutam if p.classe >= 3]
+        oficiais = [p for p in soldados if p.classe == 4 or (p.a["carisma"] >= 7 and p.a["coragem"] >= 6)]
+        if len(soldados) >= 6 and oficiais and self.r() < 0.35:
+            of = max(oficiais, key=lambda q: (q.a["carisma"] + q.a["astucia"], -q.id))
+            L.formacao = True
+            self.ev("formacao", L.id, [of], f"Em {L.nome}, {self.nm(of)} junta {len(soldados)} soldados no meio da rua e forma "
+                    f"uma linha, escudo com escudo, lanças para fora. Os mortos batem na parede de escudos.",
+                    motivo="os mortos estão dentro e alguém pensou em lutar junto")
+
+    def atacado(self, v, L, res, multidao):
+        if self.r() < C.MORTE_NA_HORA[multidao]:
+            self.morrer(v, "morto pelos mortos-vivos", L.id, C.CORPO_INTEIRO[multidao])
+            res["mortos"] += 1
+        else:
+            self.morder(v, L.id)
+            res["mordidos"] += 1
+
+    def procurar_escondidos(self, L, vivos):
+        """Os mortos farejam. Quem está escondido pode passar despercebido; o cheiro disfarçado ajuda muito."""
+        for p in vivos:
+            if not p.escondido:
+                continue
+            chance = C.ACHA_ESCONDIDO * (1.3 - 0.06 * p.a["astucia"]) * (C.CHEIRO_DISFARCA if p.cheiro >= self.h else 1)
+            horas = self.h - (p.esc_h if p.esc_h is not None else self.h)
+            chance *= 1 + horas / 24          # sede, fome, choro de criança: cada dia escondido pesa mais
+            if self.r() < chance or horas > 24 * C.ESCONDIDO_MAX_DIAS:
+                p.escondido = False           # foi achado, ou teve de sair atrás de água
+                p.abrigo = False
+
+    def talvez_reduto(self, L, vivos, lutam, Z):
+        if L.reduto_nome is not None or Z < 8 or len(lutam) * 1.5 > Z:
+            return
+        lideres = [p for p in vivos if p.estado == VIVO and not p.abrigo and 18 <= p.idade <= 65
+                   and p.a["coragem"] >= 7 and p.a["astucia"] >= 5]
+        if not lideres or self.r() > 0.3:
+            return
+        ch = max(lideres, key=lambda q: (q.a["coragem"] + q.a["astucia"] + q.a["carisma"], -q.id))
+        fam = [q for q in vivos if q.fam == ch.fam and q.estado == VIVO]
+        outros = [q for q in vivos if q.estado == VIVO and not q.abrigo and q.fam != ch.fam]
+        dentro = (fam + self.amostra(outros, 40))[:45]
+        nome = {"mosteiro": "a capela", "castelo": "a torre de menagem", "cidadela": "a torre do rei",
+                "bairro": "a igreja do bairro", "vila": "a torre da igreja"}.get(L.tipo, "a igreja")
+        L.reduto_nome = nome
+        carp = sum(1 for q in dentro if q.papel == "carpinteiro")
+        L.reduto_hp = C.REDUTO_HP + 10 * carp
+        for q in dentro:
+            q.abrigo, q.reduto = True, True
+        self.ev("reduto", L.id, [ch], f"Com os mortos nas ruas de {L.nome}, {self.nm(ch)} junta {self.pessoas(len(dentro))} "
+                f"dentro {contrai(nome)} e tranca a porta com bancos e vigas.", motivo="os mortos tomaram as ruas", n=len(dentro))
+
+    def quebrar_portas(self, L, res, batendo=()):
+        batendo = [z for z in batendo if z.estado == ZUMBI]
+        no_reduto = [p for p in self.vivos_em(L.id) if p.reduto]
+        so_reduto = bool(no_reduto) and all(p.reduto for p in self.vivos_em(L.id) if p.abrigo)
+        if so_reduto and L.reduto_nome and L.reduto_hp > 0 and batendo:
+            L.reduto_hp -= len(batendo) * self.nivel_porta()
+            if L.reduto_hp <= 0:
+                presos = [p for p in self.vivos_em(L.id) if p.reduto]
+                for p in presos:
+                    p.abrigo, p.reduto = False, False
+                self.ev("reduto_cai", L.id, presos[:1], f"A porta {contrai(L.reduto_nome)} em {L.nome} cede. Lá dentro "
+                        f"{'estava' if len(presos) == 1 else 'estavam'} {self.pessoas(len(presos))}.", n=len(presos))
+            return
+        while True:
+            inteiras = L.casas - L.quebradas
+            if inteiras <= 0:
+                break
+            hp = C.PORTA_BARRICADA if L.barricadas > L.quebradas else C.PORTA_CASA
+            if L.dano_portas < hp:
+                break
+            L.dano_portas -= hp
+            L.quebradas += 1
+            dentro = [p for p in self.vivos_em(L.id) if (p.abrigo or p.cela) and not p.reduto and not p.escondido]
+            casa = self.amostra(dentro, C.GENTE_POR_CASA)
+            if not casa:
+                break
+            for p in casa:
+                p.abrigo = p.cela = False
+            self.barulho(L, 3)
+            z = batendo.pop(0) if batendo else None
+            if z is None:
+                continue
+            # a porta cede: quem está dentro não tem para onde correr
+            lutadores = [p for p in casa if p.classe >= 1][:4]
+            if lutadores:
+                self.luta_time(lutadores, z, L, res, len(self.Zin[L.id]))
+            if z.estado == ZUMBI:
+                for v in [p for p in casa if p.estado == VIVO]:
+                    if self.r() < 0.75:
+                        self.atacado(v, L, res, 0)
+                batendo.append(z)
+
+    def luta_aberta(self, vivos, zs, L, contexto, destino=None):
+        """Luta fora de muros: cada morto contra um time; mortos sem time pegam quem não luta."""
+        res = {"z_mortos": 0, "mortos": 0, "mordidos": 0, "herois": []}
+        vivos = [p for p in vivos if p.estado in VIVOS]
+        lutam = [p for p in vivos if p.classe >= 2 and self.enfrenta(p, L, base=7) or p.classe >= 3 or
+                 (p.classe == 1 and self.enfrenta(p, L, base=10))]
+        civis = [p for p in vivos if p not in set(lutam)]
+        civis.sort(key=lambda q: (0 if (q.idade < 12 or q.idade > 60) else 1, q.id))   # os mais lentos primeiro
+        zs = [z for z in zs if z.estado == ZUMBI]
+        ne = min(len(zs), len(lutam))
+        times = [[] for _ in range(ne)]
+        for i, p in enumerate(self.amostra(lutam, len(lutam))):
+            if i < ne * 4:
+                times[i % ne].append(p)
+        for z, time in zip(zs[:ne], times):
+            self.luta_time(time, z, L, res, len(zs), destino)
+        for z in zs[ne:]:
+            for _ in range(2 if self.r() < 0.5 else 1):
+                if z.estado != ZUMBI or not civis:
+                    break
+                v = civis.pop(0)
+                if v.estado == VIVO:
+                    lid = L.id if L else None
+                    if self.r() < 0.5:
+                        self.morrer(v, "morto pelos mortos-vivos", lid, 0.8, destino)
+                        res["mortos"] += 1
+                    else:
+                        self.morder(v, lid)
+                        res["mordidos"] += 1
+        if L is not None:
+            res["herois"] = res["herois"][:1]
+        return res
+
+    def resumo_luta(self, res):
+        p = []
+        if res.get("mortos"):
+            p.append(f"{self.pessoas(res['mortos'], 'vivo morre', 'vivos morrem')}")
+        if res.get("mordidos"):
+            p.append(f"{self.pessoas(res['mordidos'], 'é mordido', 'são mordidos')}".replace("1 é", "1 é"))
+        if res.get("z_mortos"):
+            p.append(f"{self.pessoas(res['z_mortos'], 'morto-vivo cai', 'mortos-vivos caem')}")
+        txt = (", ".join(p[:-1]) + " e " + p[-1]) if len(p) > 1 else (p[0] if p else "ninguém cai")
+        return txt[0].upper() + txt[1:] + "."
+
+    # ------------------------------------------------------------------ bandos sem presa vão atrás do cheiro
     def alvo_por_cheiro(self, lid):
         L = self.L[lid]
         best, bs = None, 0.0

@@ -545,9 +545,184 @@ class Mundo:
                 self.medidas_contra_escondidos(L, p)
         p.abrigo = False
 
+    def medidas_contra_escondidos(self, L, quem_virou):
+        ld = self.lider(L)
+        if ld is None:
+            return
+        novas = []
+        if not L.pol.get("caserna") and quem_virou.suspeito >= self.h - 24 and (ld.a["astucia"] >= 7 or ld.classe >= 3) \
+                and self.r() < 0.5:
+            L.pol["caserna"] = True
+            novas.append("quem lutar com os mortos dorme trancado na caserna, com guarda na porta, até passar um dia")
+        if not L.pol.get("revista") and ld.a["astucia"] >= 6 and self.r() < 0.4:
+            L.pol["revista"] = True
+            novas.append("todo mundo é revistado duas vezes por dia, de manhã e de noite, à procura de mordidas")
+        if novas:
+            self.ev("decreto", L.id, [ld], f"Em {L.nome}, depois que {self.nm(quem_virou)} virou lá dentro, {self.nm(ld)} decide: "
+                    + "; ".join(novas) + ".", motivo=f"{self.nm(quem_virou)} escondeu a mordida")
+
+    def revista(self):
+        """Duas vezes por dia, onde há revista: a mordida escondida pode ser achada antes de virar."""
+        for pid in sorted(self.mordidos):
+            p = self.P[pid]
+            if p.esconde and p.loc in self.L and pid in self.H[p.loc] and self.L[p.loc].pol.get("revista") \
+                    and self.r() < C.REVISTA_ACHA:
+                L = self.L[p.loc]
+                p.esconde = False
+                self.contas["achados_na_revista"] += 1
+                self.aplicar_politica_mordido(p, L, achado="na revista")
+
+    def virou_na_estrada(self, z, g):
+        """Quem vira no meio de um grupo em viagem ataca os companheiros ali mesmo."""
+        vivos = [self.P[i] for i in g["m"] if self.P[i].estado in VIVOS]
+        hd = {"id": self.novo_id(), "ids": [z.id], "de": g["de"], "para": g["para"], "km": g["km"],
+              "feito": g["feito"], "vel": C.VEL_ZUMBI_CAÇA, "parada": False}
+        res = self.luta_aberta(vivos, [z], None, "estrada", destino=lambda q: hd["ids"].append(q.id))
+        hd["ids"] = [i for i in hd["ids"] if self.P[i].estado == ZUMBI]
+        if hd["ids"]:
+            self.hordas.append(hd)
+        if res["mortos"] + res["mordidos"] and (g.get("holofote") or len(vivos) >= 6):
+            self.ev("virou", None, [z], f"Na estrada de {self.L[g['de']].nome} para {self.L[g['para']].nome}, "
+                    f"{self.nm(z)} vira morto-vivo no meio do grupo. {self.resumo_luta(res)}")
+
+    def relogios(self):
+        while self.timers and self.timers[0][0] <= self.h:
+            _, _, tipo, pid = heapq.heappop(self.timers)
+            p = self.P[pid]
+            if tipo == "vira" and p.estado == MORDIDO:
+                self.transformar(p)
+        if self.corpos:
+            pend = []
+            levantou = Counter()
+            for c in self.corpos:
+                if c["h"] > self.h:
+                    pend.append(c)
+                    continue
+                p = self.P[c["id"]]
+                if p.estado != MORTO:
+                    continue
+                lid = c["lugar"]
+                if lid is None:
+                    p.estado = ZUMBI
+                    continue
+                L = self.L[lid]
+                caos = bool(self.Zin[lid])
+                vivos = self.H[lid]
+                if vivos and not caos and "levanta" in L.sabe and L.pol["corpos"] != "velar" and self.r() < 0.92:
+                    p.causa = (p.causa or "") + "; cabeça cortada antes de levantar"
+                    self.contas["corpos_cuidados"] += 1
+                    continue
+                p.estado, p.loc = ZUMBI, lid
+                self.Zin[lid].add(p.id)
+                levantou[lid] += 1
+                self.contas["levantaram"] += 1
+                if vivos and not caos and "levanta" not in L.sabe:
+                    self.aprender(L, "levanta", f"Em {L.nome}, os mortos se levantam durante o velório, no meio "
+                                                f"de quem rezava por eles.", [p])
+            self.corpos = pend
+
+    # ------------------------------------------------------------------ conhecimento e alerta
     def cidade(self, L):
         return [self.L[b] for b in sorted(M.CAPITAL)] if L.id in M.CAPITAL else [L]
 
+    def sinal(self, L):
+        """Fogueiras de sinal: a fumaça avisa as outras fortalezas da rede no mesmo dia."""
+        rede = self.flags.get("sinais") or []
+        if L.id in rede:
+            for lid in rede:
+                X = self.L[lid]
+                if X.alerta is None and self.H[lid]:
+                    X.alerta = self.h
+                    X.sabe.add("mortos")
+                    self.decidir_politica(X, "ao ver a fumaça das fogueiras de sinal")
+
+    def aprender(self, L, coisa, texto, quem=()):
+        self.sinal(L)
+        novo = coisa not in L.sabe
+        for X in self.cidade(L):
+            X.sabe.add(coisa)
+            X.sabe.add("mortos")
+            if X.alerta is None:
+                X.alerta = self.h
+            if X.tipo == "bairro" and X.barricada_rua == 0 and not self.Zin[X.id]:
+                X.barricada_rua = C.BARRICADA_RUA
+        if novo:
+            self.barulho(L, 4)
+            self.ev("aprende", L.id, list(quem), texto, saber=coisa)
+            self.decidir_politica(L, f"depois de {'ver' if coisa != 'noticia' else 'ouvir'} o que aconteceu")
+
+    def ensinar(self, L, sabe, de_quem):
+        sabe = HQ.ouvir(self, L, set(sabe), de_quem)
+        novos = set(sabe) - L.sabe
+        if not novos:
+            return
+        for X in self.cidade(L):
+            X.sabe |= set(sabe)
+            if X.alerta is None:
+                X.alerta = self.h
+            if X.tipo == "bairro" and X.barricada_rua == 0 and not self.Zin[X.id]:
+                X.barricada_rua = C.BARRICADA_RUA
+        if len(novos) >= 1 and ("mortos" in novos or "mordida" in novos):
+            self.ev("noticia", L.id, [], f"{de_quem} {'chegam' if de_quem.startswith('Os ') else 'chega'} a {L.nome} com a notícia: "
+                    + self.texto_noticia(novos), saber=sorted(novos))
+        self.decidir_politica(L, "depois da notícia")
+
+    def texto_noticia(self, sabe):
+        partes = []
+        if "mortos" in sabe:
+            partes.append("os mortos estão andando e atacando gente")
+        if "mordida" in sabe:
+            partes.append("quem é mordido vira um deles em poucas horas")
+        if "levanta" in sabe:
+            partes.append("quem morre nos dentes deles se levanta logo depois")
+        if "cabeca" in sabe:
+            partes.append("só param quando a cabeça é destruída")
+        return "; ".join(partes) + "."
+
+    # ------------------------------------------------------------------ política dos líderes
+    def decidir_politica(self, L, porque):
+        ld = self.lider(L)
+        if ld is None:
+            return
+        a = ld.a
+        antes = dict(L.pol)
+        sabe = L.sabe
+        if "mordida" in sabe:
+            if a["crueldade"] >= 6 or (a["astucia"] >= 6 and a["piedade"] <= 6):
+                L.pol["mordidos"] = "executar"
+            elif a["piedade"] >= 8 and a["fe"] >= 7:
+                L.pol["mordidos"] = "cuidar"
+            else:
+                L.pol["mordidos"] = "isolar"
+            if (a["astucia"] + (10 - a["piedade"])) >= 13:
+                L.pol["portao"] = "fechado"
+            elif a["astucia"] >= 5:
+                L.pol["portao"] = "quarentena"
+            else:
+                L.pol["portao"] = "inspecao"
+        elif "mortos" in sabe:
+            L.pol["portao"] = "inspecao" if a["astucia"] >= 5 else "aberto"
+        if "levanta" in sabe:
+            L.pol["corpos"] = "velar" if (a["fe"] >= 9 and a["piedade"] >= 8) else "queimar"
+        if "mortos" in sabe:
+            L.pol["defender"] = True
+        if L.pol != antes and self.h - L.ultimo_decreto >= 2:
+            L.ultimo_decreto = self.h
+            txt = []
+            if L.pol["portao"] != antes["portao"]:
+                txt.append({"fechado": "ninguém entra", "inspecao": "quem chega é revistado no portão",
+                            "quarentena": "quem chega espera um dia inteiro do lado de fora antes de entrar",
+                            "aberto": "os portões ficam abertos para quem fugir"}[L.pol["portao"]])
+            if L.pol["mordidos"] != antes["mordidos"]:
+                txt.append({"executar": "todo mordido morre antes de virar", "isolar": "todo mordido vai para a cela",
+                            "cuidar": "os mordidos ficam com a família e com os curandeiros"}[L.pol["mordidos"]])
+            if L.pol["corpos"] != antes["corpos"]:
+                txt.append({"queimar": "os mortos têm a cabeça cortada e são queimados na hora",
+                            "velar": "os mortos serão velados e enterrados como manda a Igreja"}[L.pol["corpos"]])
+            if txt:
+                self.ev("decreto", L.id, [ld], f"Em {L.nome}, {self.nm(ld)} decide, {porque}: " + "; ".join(txt) + ".")
+
+    # ------------------------------------------------------------------ mortos agem
     def mortos_agem(self):
         for lid in sorted(self.L):
             if self.Zout[lid]:

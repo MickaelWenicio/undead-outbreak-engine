@@ -1571,6 +1571,244 @@ class Mundo:
                 self.ev("quarentena", lid, [], f"Depois de um dia inteiro esperando do lado de fora, "
                         f"{self.pessoas(n, 'pessoa entra', 'pessoas entram')} em {self.L[lid].nome}.", n=n)
 
+    def vivos_reagem(self):
+        self.registrar_recusas()
+        self.soltar_quarentena()
+        if self.hora() in (6, 18):
+            self.revista()
+        hora = self.hora()
+        for lid in sorted(self.L):
+            L = self.L[lid]
+            if not self.H[lid]:
+                continue
+            if not self.Zin[lid]:
+                saiu = [self.P[i] for i in sorted(self.H[lid]) if self.P[i].escondido]
+                if saiu:
+                    for q in saiu:
+                        q.escondido = False
+                    if len(saiu) >= 3:
+                        self.ev("esconderijo", lid, saiu[:1], f"Os mortos vão embora de {L.nome}. "
+                                f"{self.pessoas(len(saiu), 'pessoa sai', 'pessoas saem')} de porões e sótãos, onde ficaram "
+                                f"sem respirar enquanto eles passavam.", n=len(saiu))
+                if L.reduto_nome and any(self.P[i].reduto for i in self.H[lid]):
+                    for i in self.H[lid]:
+                        self.P[i].reduto = False
+                    self.ev("reduto_sai", lid, [], f"Os mortos deixam {L.nome}. Quem estava trancado {contrai(L.reduto_nome, 'em')} sai.")
+                    L.reduto_nome = None
+            if not self.Zin[lid] and hora in (21, 6):
+                noite = hora == 21
+                for pid in self.H[lid]:
+                    q = self.P[pid]
+                    if q.cela:
+                        continue
+                    # à noite todos vão para casa, menos a guarda; de dia saem para trabalhar
+                    q.abrigo = noite and not (q.classe >= 3 and self.r() < 0.4) or (q.estado == MORDIDO and q.esconde)
+            if self.Zin[lid]:
+                self.panico(L)
+            elif L.alerta is not None:
+                self.preparar(L)
+            self.mordidos_decidem(L)
+        self.rei_decide()
+
+    def panico(self, L):
+        vivos = self.vivos_em(L.id)
+        expostos = [p for p in vivos if not p.abrigo and not p.cela and not p.escondido]
+        cap = max(0, (L.casas - L.quebradas) * C.GENTE_POR_CASA - sum(1 for p in vivos if p.abrigo))
+        # famílias decidem: correr para fora ou trancar-se em casa
+        fams = defaultdict(list)
+        for p in expostos:
+            fams[p.fam].append(p)
+        saem = []
+        disfarce_novo = []
+        for p in expostos:
+            if p.escondido or p.classe >= 3:
+                continue
+            if p.a["astucia"] + p.a.get("genio", 5) >= 15 and p.cheiro < self.h                     and self.r() < C.IDEIA_CHEIRO * math.exp(self.flags.get("cultura", {}).get("genio", 0.0)):
+                p.cheiro = self.h + 72
+                disfarce_novo.append(p)
+        if disfarce_novo and not self.flags.get(f"cheiro_{L.id}"):
+            self.flags[f"cheiro_{L.id}"] = self.h
+            q = disfarce_novo[0]
+            self.ev("cheiro", L.id, [q], f"Em {L.nome}, {self.nm(q)} percebe que os mortos acham as pessoas pelo cheiro. "
+                    f"{self.g(q, 'Ele', 'Ela')} esfrega no corpo o sangue de um morto caído e passa a andar entre eles sem ser {self.g(q, 'notado', 'notada')}.",
+                    motivo="os mortos farejam")
+        for fam, ps in sorted(fams.items()):
+            chefe = max(ps, key=lambda q: q.idade)
+            if chefe.classe >= 3 and len(ps) == 1:
+                continue
+            entende = "mordida" in L.sabe or L.medo >= 60
+            if self.r() < C.FOGE_CHANCE * (1.4 if L.tipo == "aldeia" else 0.8) * (1.0 if entende else 0.15):
+                saem.append(ps)
+            elif entende and cap <= 0 and self.r() < 0.15 + 0.04 * chefe.a["astucia"]:
+                for p in ps:      # sem casa inteira para trancar: porão, sótão, palheiro
+                    p.escondido = True
+                    p.esc_h = self.h
+            elif cap > 0:
+                for p in ps:
+                    if cap > 0 and self.r() < 0.7:
+                        p.abrigo = True
+                        cap -= 1
+        if saem:
+            n = 0
+            destinos = Counter()
+            for ps in saem:
+                para = self.refugio(L.id, ps)
+                if para is None:
+                    continue
+                # a capital: quem está num bairro tenta a cidadela antes
+                if L.tipo == "bairro" and self.L["cidadela"].pol["portao"] != "fechado" and self.H["cidadela"] \
+                        and not self.Zin["cidadela"]:
+                    para = "cidadela"
+                if self.Zout[L.id]:
+                    zs = [self.P[i] for i in self.amostra(sorted(self.Zout[L.id]), 3)]
+                    self.luta_aberta(ps, zs, L, "saida")
+                    ps = [p for p in ps if p.estado in VIVOS]
+                if ps:
+                    g = self.partir_grupo(ps, L.id, para, "fuga")
+                    n += len(ps)
+                    soltos = sorted(self.Zin[L.id])
+                    k = int(self.rng.binomial(len(soltos), C.PERSEGUE)) if g and soltos else 0
+                    k = min(k, len(ps) * 2)
+                    if k:
+                        atras = self.amostra(soltos, k)
+                        for zid in atras:
+                            self.Zin[L.id].discard(zid)
+                            self.P[zid].loc = None
+                        self.hordas.append({"id": self.novo_id(), "ids": atras, "de": L.id, "para": g["para"], "km": g["km"],
+                                            "feito": 0.0, "vel": C.VEL_ZUMBI_CAÇA, "parada": False})
+                    destinos[self.L[para].nome] += len(ps)
+            if n >= 8:
+                d = ", ".join(f"{v} para {k}" for k, v in destinos.most_common(3))
+                self.ev("fuga", L.id, [], f"{self.pessoas(n, 'pessoa foge', 'pessoas fogem')} de {L.nome} no meio do ataque: {d}.",
+                        n=n)
+
+    def preparar(self, L):
+        """Lugar em alerta, ainda sem mortos dentro: barricadas, armas, mensageiros e, se for fraco, retirada."""
+        ld = self.lider(L)
+        perto = [h for h in self.hordas if h["para"] == L.id] + [None] * len(self.Zout[L.id])
+        viu = L.invadida_em is not None or bool(self.Zout[L.id]) or any(h["para"] == L.id for h in self.hordas)
+        if ld and not L.pediu_ajuda and L.tipo not in ("cidadela", "bairro") and (viu or L.tipo in ("vila", "castelo", "mosteiro")):
+            L.pediu_ajuda = True
+            cav = [p for p in self.adultos(L.id) if p.classe >= 1 and p.idade < 45 and not p.holofote]
+            if cav:
+                m = self.escolhe(cav)
+                g = self.partir_grupo([m], L.id, "porta", "mensageiro", sabe=L.sabe)
+                if g:
+                    g["pedido"] = L.id
+        if "mordida" in L.sabe and L.tipo == "aldeia" and ld:
+            ameaca = sum(len(h["ids"]) for h in self.hordas if h["para"] == L.id and h["km"] - h["feito"] <= 8)
+            perto = sum(len(self.Zin[nb]) for nb, km, _ in self.adj[L.id] if km <= 7 and not self.H[nb])
+            if (ameaca >= 3 or perto >= 5) and self.r() < 0.08 + 0.02 * (10 - ld.a["coragem"]):
+                destino = self.refugio(L.id, self.vivos_em(L.id))
+                if destino:
+                    todos = [p for p in self.vivos_em(L.id) if not p.cela]
+                    self.partir_grupo(todos, L.id, destino, "fuga", motivo="retirada")
+                    L.estado = "vazia"
+                    self.ev("evacuacao", L.id, [ld], f"{self.nm(ld)} manda esvaziar {L.nome}: "
+                            f"{self.pessoas(len(todos))} saem para {self.L[destino].nome} levando o que conseguem carregar.",
+                            motivo="mortos perto" if ameaca else "vizinhos caídos", n=len(todos))
+                    return
+
+    def mordidos_decidem(self, L):
+        for pid in sorted(self.mordidos):
+            p = self.P[pid]
+            if p.loc != L.id or p.viagem is not None or p.esconde is not None or pid not in self.H[L.id]:
+                continue
+            if "mordida" not in L.sabe:
+                p.esconde = False          # não sabe que é grave: conta, e é cuidado em casa
+                p.abrigo = True
+                continue
+            pol = L.pol["mordidos"]
+            chance = C.ESCONDE_BASE - (0.2 if ("amputacao" in L.sabe or "cura" in L.sabe) else 0) \
+                + {"executar": 0.35, "isolar": 0.15, "cuidar": -0.1}[pol] \
+                + (10 - p.a["piedade"]) * 0.02 + (10 - p.a["lealdade"]) * 0.015 - p.a["coragem"] * 0.01
+            if self.r() < clamp(chance, 0.05, 0.85):
+                p.esconde = True
+                p.abrigo = True
+            else:
+                p.esconde = False
+                self.aplicar_politica_mordido(p, L, achado="contou")
+
+    def aplicar_politica_mordido(self, p, L, achado):
+        pol = L.pol["mordidos"]
+        ld = self.lider(L)
+        salva = None
+        if "amputacao" in L.sabe and self.r() < C.AMPUTACAO_SALVA:
+            salva = "amputacao"
+        elif "cura" in L.sabe and self.r() < C.CURA_SALVA:
+            salva = "cura"
+        if salva:
+            p.estado, p.esconde, p.t_vira = VIVO, None, None
+            self.mordidos.discard(p.id)
+            if salva == "amputacao":
+                p.classe = max(0, p.classe - 1)
+                p.arma = max(0, (p.arma or 0) - 1)
+            self.contas["salvos_" + salva] += 1
+            if p.holofote or self.contas["salvos_" + salva] <= 2:
+                self.ev("salvo", L.id, [p], f"Em {L.nome}, {self.nm(p)} é {self.g(p, 'mordido', 'mordida')} e "
+                        + ("tem o braço cortado e o corte queimado em seguida. Sobrevive, sem o braço, e não vira."
+                           if salva == "amputacao" else "toma o remédio amargo nas primeiras horas. Não vira."),
+                        motivo=salva)
+            return
+        if pol == "executar":
+            self.morrer(p, "executado por estar mordido", L.id)
+            self.contas["executados"] += 1
+            for q in self.parentes(p):
+                if q.estado in VIVOS and q.loc == L.id and ld and q.a["piedade"] >= 6:
+                    self.guardar_rancor(q, ld, 25, None, f"a execução de {self.relacao(q, p)}, {self.nm(p)}")
+            if p.holofote or self.contas["executados"] <= 2 or (ld and self.contas["executados"] % 25 == 0):
+                self.ev("execucao", L.id, [p, ld], f"Em {L.nome}, {self.nm(p)} é {self.g(p, 'executado', 'executada')} "
+                        f"antes de virar.", motivo=f"decreto de {self.nm(ld)}" if ld else "decreto")
+        elif pol == "isolar":
+            p.cela = True
+            p.abrigo = False
+        else:
+            p.abrigo = True
+
+    # ------------------------------------------------------------------ o rei
+    def rei_decide(self):
+        C_ = self.L["cidadela"]
+        rei = self.lider(C_)
+        if rei is None or "mortos" not in C_.sabe or self.flags.get("rei_fechou"):
+            return
+        self.flags["rei_fechou"] = self.h
+        bairros = [self.L[b] for b in sorted(M.CAPITAL)]
+        for B in bairros:
+            B.sabe |= C_.sabe
+            if B.alerta is None:
+                B.alerta = self.h
+            self.decidir_politica(B, "por ordem do rei")
+        abre = rei.a["piedade"] >= 7 and rei.a["astucia"] <= 6
+        for b in sorted(M.PORTOES_DA_CIDADE):
+            self.L[b].pol["portao"] = "inspecao" if abre else "fechado"
+        self.ev("rei", "cidadela", [rei], f"{self.nm(rei)} manda fechar Alvor. "
+                + ("Os portões da cidade só abrem para quem passar pela revista."
+                   if abre else "Ninguém mais entra na capital, nem quem vem fugindo."),
+                motivo="a notícia dos mortos chegou à corte")
+
+    def pedido_de_ajuda(self, L_capital_bairro, origem):
+        rei = self.lider(self.L["cidadela"])
+        O = self.L[origem]
+        if rei is None or self.flags.get(f"ajuda_{origem}"):
+            return
+        self.flags[f"ajuda_{origem}"] = self.h
+        manda = rei.a["piedade"] + rei.a["coragem"] >= 12 and O.tipo in ("vila", "castelo", "mosteiro")
+        if manda:
+            sold = [p for p in self.vivos_em("cidadela") + self.vivos_em("porta") if p.papel == "soldado" and p.estado == VIVO]
+            ida = self.amostra(sold, min(30, len(sold) // 4))
+            for p in ida:
+                self.H[p.loc].discard(p.id)
+                p.loc = "porta"
+                self.H["porta"].add(p.id)
+            if ida:
+                self.partir_grupo(ida, "porta", origem, "soldados")
+                self.ev("rei", "cidadela", [rei], f"{self.nm(rei)} manda {len(ida)} soldados para {O.nome}, "
+                        f"que pediu socorro.", motivo=f"pedido de socorro de {O.nome}")
+        elif O.tipo in ("vila", "castelo", "mosteiro"):
+            self.ev("rei", "cidadela", [rei], f"O pedido de socorro de {O.nome} chega à corte. {self.nm(rei)} não manda ninguém.",
+                    motivo="o rei guarda os soldados para a capital")
+
+    # ------------------------------------------------------------------ o dia: economia, obras, intrigas
     def novo_dia(self):
         est = self.estacao()
         self.geada = self.r() < (C.FROST_INVERNO if est == "inverno" else C.FROST_OUTONO if est == "outono" else 0)
@@ -1676,6 +1914,11 @@ class Mundo:
                         self.Fora[lid].discard(p.id)
                         self.H[lid].add(p.id)
                     self.partir_grupo(ps, lid, outro, "fuga")
+
+    def seguro(self, L):
+        if self.Zin[L.id] or self.Zout[L.id]:
+            return False
+        return not any(h["para"] == L.id and h["feito"] > h["km"] - 6 for h in self.hordas)
 
     def registrar(self):
         vivos = sum(len(s) for s in self.H.values()) + sum(len(g["m"]) for g in self.grupos) + \

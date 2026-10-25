@@ -1920,6 +1920,167 @@ class Mundo:
             return False
         return not any(h["para"] == L.id and h["feito"] > h["km"] - 6 for h in self.hordas)
 
+    def economia(self, L):
+        vivos = self.vivos_em(L.id)
+        n = len(vivos)
+        est = self.estacao()
+        mult = INV = C.INVERNO_MULT if est == "inverno" else 1.0
+        if (self.dia() - 1) % 365 <= C.COLHEITA_DIAS[1]:     # toda colheita de setembro, não só a primeira
+            mult = C.COLHEITA_MULT
+        prod = 0.0
+        if not self.seguro(L):
+            if "hortas" in L.ideias:
+                prod += sum(0.35 for p in vivos if p.papel in ("campones", "pastor") and p.estado == VIVO)
+            if "pesca_mar" in L.ideias:
+                prod += sum(C.PRODUZ["pescador"] * 0.7 for p in vivos if p.papel == "pescador" and p.estado == VIVO)
+        if "campos" in L.ideias and self.seguro(L) and L.medo < 70 and L.tipo in ("bairro", "cidadela", "vila", "castelo"):
+            # lavradores improvisados: metade dos adultos sai de dia para os campos de fora, a 60% de um camponês
+            prod += sum(C.PRODUZ["campones"] * C.CAMPOS_RENDE * mult for p in vivos
+                        if p.estado == VIVO and 16 <= p.idade <= 60 and not p.cela and p.papel not in ("campones", "pastor", "pescador")) * 0.5
+        if L.tipo == "ilheu":
+            prod += sum(1.2 for p in vivos if p.estado == VIVO and 14 <= p.idade <= 65)
+        elif self.seguro(L) and L.medo < 70:
+            for p in vivos:
+                if p.estado == VIVO and 14 <= p.idade <= 65 and not p.cela:
+                    base = C.PRODUZ.get(p.papel, 0.0)
+                    if "colonia" in L.ideias and p.papel not in ("pescador", "pastor"):
+                        base = max(base, C.PRODUZ["campones"] * C.COLONO_RENDE)
+                    if p.papel == "pastor":
+                        base *= min(1.0, L.gado / max(1.0, 8.0 * sum(1 for q in vivos if q.papel == "pastor")))
+                    if p.papel == "pescador":
+                        prod += base * (0.6 if est == "inverno" else 1.0)
+                    else:
+                        prod += base * mult
+            L.lenha += sum(C.LENHA_POR_LENHADOR for p in vivos if p.papel == "lenhador")
+        L.comida += prod
+        gasto = n * C.CONSUMO * L.pol["racao"] * (0.85 if "reorganiza" in L.ideias else 1.0)
+        L.comida -= gasto
+        if L.comida < 0:
+            L.comida = 0.0
+            L.fome += 1
+        else:
+            L.fome = max(0, L.fome - 1)
+        if L.fome >= 7:
+            mortos = []
+            for q in vivos:
+                fraco = q.idade < 6 or q.idade > 65
+                if self.r() < (0.04 if fraco else (0.012 if L.fome >= 14 else 0.004)):
+                    mortos.append(q)
+            for q in mortos:
+                self.morrer(q, "fome", L.id)
+            if mortos:
+                self.contas["fome"] += len(mortos)
+                if len(mortos) >= 3:
+                    self.ev("fome", L.id, mortos[:1], f"Em {L.nome}, {self.pessoas(len(mortos), 'pessoa morre', 'pessoas morrem')} "
+                            f"de fome. Faz {L.fome} dias que o celeiro está vazio.", n=len(mortos))
+        if (L.fome >= 2 or L.comida / max(1, n) < 3) and not self.Zin[L.id]:
+            self.expedicao(L, vivos)
+        dias = L.comida / max(1, n)
+        L.preco = round(clamp(14 / max(0.5, dias), 0.5, 25), 2)
+        ld = self.lider(L)
+        if ld and dias < 12 and L.pol["racao"] == 1.0:
+            L.pol["racao"] = 0.75
+            self.ev("racao", L.id, [ld], f"Em {L.nome}, a comida dá para {int(dias)} dias. {self.nm(ld)} corta a ração "
+                    f"para três quartos.", dias=round(dias, 1))
+        elif ld and dias < 5 and L.pol["racao"] > 0.5:
+            L.pol["racao"] = 0.5
+            self.ev("racao", L.id, [ld], f"Em {L.nome}, sobra comida para {int(dias)} dias. A ração cai para a metade.",
+                    dias=round(dias, 1))
+        # portão e barricada consertados todo dia, se houver lenha e gente
+        if L.muro > 0 and "mortos" in L.sabe and not L.reforcado and not self.Zin[L.id] and L.lenha >= 150:
+            engenhosos = [q for q in vivos if q.estado == VIVO and 16 <= q.idade <= 70 and
+                          (q.a.get("genio", 5) >= 8 or (q.a["astucia"] >= 8 and q.a.get("genio", 5) >= 6))]
+            if engenhosos and self.r() < C.IDEIA_REFORCO:
+                q = self.escolhe(engenhosos)
+                L.reforcado = True
+                L.portao_max = C.MURO[L.muro][0] * C.REFORCO_MULT
+                L.portao_hp = max(0.0, L.portao_hp) + C.MURO[L.muro][0] * (C.REFORCO_MULT - 1)
+                L.lenha -= 150
+                self.ev("reforco_portao", L.id, [q], f"Em {L.nome}, {self.nm(q)} tem a ideia de reforçar o portão por dentro "
+                        f"com troncos atravessados e as grades de ferro do celeiro. O povo trabalha a noite inteira.",
+                        motivo="o medo de os mortos derrubarem o portão")
+        if L.muro > 0 and not self.Zin[L.id] and L.estado != "caida":
+            cheio = L.portao_max or C.MURO[L.muro][0]
+            falta = cheio - max(0.0, L.portao_hp)
+            if falta > 0 and L.lenha > 0:
+                conserto = min(falta, C.CONSERTO_DIA, L.lenha * 3)
+                L.portao_hp = max(0.0, L.portao_hp) + conserto
+                L.lenha -= conserto / 3
+        if L.tipo == "bairro" and "mortos" in L.sabe and not self.Zin[L.id] and L.barricada_rua < C.BARRICADA_RUA and L.lenha > 0:
+            conserto = min(C.BARRICADA_RUA - L.barricada_rua, C.CONSERTO_DIA, L.lenha * 3)
+            L.barricada_rua += conserto
+            L.lenha -= conserto / 3
+        # barricadas e paliçada: quem sabe dos mortos se prepara
+        if "mortos" in L.sabe and self.seguro(L):
+            falta = L.casas - L.barricadas
+            pode = int(min(falta, L.lenha // C.BARRICADA_LENHA, sum(1 for p in vivos if p.classe >= 1) // 3))
+            if pode > 0:
+                L.barricadas += pode
+                L.lenha -= pode * C.BARRICADA_LENHA
+            if False:   # paliçada agora é decisão do líder, com custo e tempo (hierarquia.muralhas)
+                trabalho = sum(1 for p in vivos if p.classe >= 1 and p.estado == VIVO)
+                usa = min(L.lenha, trabalho * 2.0)
+                L.obra += usa
+                L.lenha -= usa
+                if L.obra >= C.PALICADA_LENHA:
+                    L.muro, L.portao_hp, L.obra = 1, C.MURO[1][0], 0.0
+                    self.ev("palicada", L.id, [ld], f"{L.nome} termina uma paliçada de troncos em volta das casas. "
+                            f"Foi feita pelos próprios moradores, sem ajuda de ninguém.", n=n)
+            ferreiros = sum(1 for p in vivos if p.papel == "ferreiro" and p.estado == VIVO)
+            L.lancas += ferreiros * C.LANCA_POR_FERREIRO
+            if L.lancas >= 1:
+                novos = [p for p in vivos if p.classe == 1 and p.a["coragem"] >= 5 and 16 <= p.idade <= 55]
+                for p in novos[:int(L.lancas)]:
+                    p.classe, p.arma = 2, 1
+                    L.lancas -= 1
+        # comércio: quem tem sobra manda carroça para vizinho com falta, se a estrada parece segura
+        if self.seguro(L) and dias > 25 and n > 30 and L.cavalos + L.gado >= 2:
+            for nb, km, tipo in self.adj[L.id]:
+                T = self.L[nb]
+                if tipo != "estrada" or not self.H[nb] or not self.seguro(T):
+                    continue
+                if T.comida / max(1, len(self.H[nb])) < 8:
+                    mercs = [p for p in vivos if p.papel in ("mercador", "campones") and p.estado == VIVO and 18 <= p.idade <= 55]
+                    if mercs:
+                        carga = min(L.comida * 0.2, len(self.H[nb]) * 6)
+                        L.comida -= carga
+                        g = self.partir_grupo(self.amostra(mercs, 2), L.id, nb, "comercio", carga=carga)
+                        if g and self.r() < 0.3:
+                            self.ev("comercio", L.id, [], f"Uma carroça sai de {L.nome} com comida para vender em "
+                                    f"{T.nome}, onde o pão já custa {T.preco:.0f} vezes o preço de antes.", carga=round(carga))
+                    break
+
+    def expedicao(self, L, vivos):
+        """Sem comida, um grupo armado sai para buscar nos lugares abandonados, mesmo com os mortos por perto."""
+        if self.flags.get(f"exp_{L.id}", -99) > self.h - 72:
+            return
+        alvos = []
+        for T in self.L.values():
+            if T.id == L.id or self.H[T.id] or T.comida < 150:
+                continue
+            d = self.km(L.id, T.id)
+            if d <= 18:
+                alvos.append((d + len(self.Zin[T.id]) * 0.05, T.id))
+        if not alvos:
+            return
+        alvos.sort()
+        bravos = [q for q in vivos if q.estado == VIVO and q.classe >= 2 and 16 <= q.idade <= 55 and not q.holofote
+                  and q.a["coragem"] >= 5]
+        if len(bravos) < 4:
+            return
+        precisa = len(vivos) * C.CONSUMO * 3            # comida de três dias para o lugar inteiro
+        por_homem = C.EXP_CARGA_CARROCA if L.cavalos + L.gado >= 2 else C.EXP_CARGA_HOMEM
+        k = int(min(len(bravos), C.EXP_MAX, max(12, precisa / por_homem)))
+        ida = self.amostra(bravos, k)
+        self.flags[f"exp_{L.id}"] = self.h
+        g = self.partir_grupo(ida, L.id, alvos[0][1], "expedicao")
+        if g:
+            g["casa"] = L.id
+            ld = self.lider(L)
+            self.ev("expedicao", L.id, [ld] + ida[:1], f"Sem comida, {self.nm(ld) if ld else 'o povo'} manda {len(ida)} homens armados "
+                    f"buscar mantimentos em {self.L[alvos[0][1]].nome}, onde não sobrou ninguém vivo.",
+                    motivo=f"fome há {L.fome} dias" if L.fome else "o celeiro quase vazio", n=len(ida))
+
     def registrar(self):
         vivos = sum(len(s) for s in self.H.values()) + sum(len(g["m"]) for g in self.grupos) + \
             sum(len(s) for s in self.Fora.values())

@@ -2082,6 +2082,181 @@ class Mundo:
                     f"buscar mantimentos em {self.L[alvos[0][1]].nome}, onde não sobrou ninguém vivo.",
                     motivo=f"fome há {L.fome} dias" if L.fome else "o celeiro quase vazio", n=len(ida))
 
+    def guardar_rancor(self, p, alvo, peso, ev_idx, motivo=None):
+        if alvo is None or p.id == alvo.id:
+            return
+        p.rancor.append([alvo.id, peso, ev_idx, motivo])
+        if alvo.id == (self.L[p.loc].lider if p.loc in self.L else None):
+            p.op -= peso
+
+    def motivo_de(self, p, alvo_id):
+        """O motivo mais forte que p guarda contra alvo_id, em texto."""
+        rs = [r for r in p.rancor if r[0] == alvo_id]
+        if not rs:
+            return None
+        r = max(rs, key=lambda x: x[1])
+        if r[3]:
+            return r[3]
+        if r[2] is not None and r[2] < len(self.log):
+            e = self.log[r[2]]
+            return f"{e['texto']} ({self.quando(e['h'])})"
+        return None
+
+    def intrigas(self):
+        for L in sorted(self.L.values(), key=lambda x: x.id):
+            vivos = [p for p in self.vivos_em(L.id) if p.estado == VIVO and not p.cela]
+            if len(vivos) < 8:
+                continue
+            ld = self.lider(L)
+            if ld is None:
+                self.novo_lider(L, "o lugar ficou sem ninguém no comando")
+                ld = self.lider(L)
+                if ld is None:
+                    continue
+            adultos = [p for p in vivos if p.idade >= 16]
+            # fome e medo pesam na opinião sobre quem manda
+            for p in adultos:
+                if p.id == ld.id:
+                    continue
+                p.op += -2.0 * min(3, L.fome) - (1.0 if L.pol["racao"] < 1 and "reorganiza" not in L.ideias else 0) \
+                    + (0.4 if self.seguro(L) else -0.6)
+                p.op = clamp(p.op, -100, 100)
+            media = sum(p.op for p in adultos) / max(1, len(adultos))
+            # golpe: raiva geral e alguém ambicioso com motivo
+            if media < C.GOLPE_RAIVA and L.tipo != "cidadela" or (L.tipo == "cidadela" and media < C.GOLPE_RAIVA - 15):
+                rivais = sorted([p for p in adultos if p.id != ld.id and p.a["ambicao"] >= 7 and p.a["carisma"] >= 6
+                                 and p.op < -15],
+                                key=lambda q: (q.op, -q.a["ambicao"], q.id))
+                pausa = self.h - self.flags.get(f"golpe_{L.id}", -10**6) >= 24 * C.GOLPE_PAUSA_DIAS
+                if rivais and pausa and self.r() < 0.35:
+                    self.flags[f"golpe_{L.id}"] = self.h
+                    rival = rivais[0]
+                    apoio = [p for p in adultos if p.op < -10]
+                    fieis = [p for p in adultos if p.op > 20]
+                    forca_a = sum(1 + (p.classe >= 3) * 2 for p in apoio)
+                    forca_f = sum(1 + (p.classe >= 3) * 2 for p in fieis) + 3
+                    motivo = self.motivo_de(rival, ld.id) or self.motivo_coletivo(L)
+                    if forca_a > forca_f:
+                        morto = ld.a["crueldade"] >= 5 or rival.a["crueldade"] >= 6
+                        if morto:
+                            self.morrer(ld, f"morto no golpe de {self.nm(rival)}", L.id)
+                        L.lider = rival.id
+                        for p in adultos:
+                            p.op = clamp(p.op + 25, -100, 100)
+                        self.ev("golpe", L.id, [rival, ld], f"Em {L.nome}, {self.nm(rival)} e {len(apoio)} apoiadores tomam o "
+                                f"comando. {self.nm(ld)} é {self.g(ld, 'morto', 'morta') if morto else self.g(ld, 'expulso', 'expulsa')}.",
+                                motivo=motivo)
+                        if not morto:
+                            outro = self.refugio(L.id, [ld])
+                            if outro:
+                                self.partir_grupo([ld], L.id, outro, "fuga")
+                    else:
+                        self.morrer(rival, "executado por tentar um golpe", L.id)
+                        self.ev("golpe", L.id, [rival, ld], f"Em {L.nome}, {self.nm(rival)} tenta tomar o comando de "
+                                f"{self.nm(ld)}, mas os fiéis resistem. {self.nm(rival)} é {self.g(rival, 'executado', 'executada')}.",
+                                motivo=motivo, falhou=True)
+            # rancor pessoal vira morte
+            for p in adultos:
+                if p.estado != VIVO or not p.rancor or p.a["crueldade"] < 6:
+                    continue
+                pesos = Counter()
+                for alvo, peso, _, _ in p.rancor:
+                    pesos[alvo] += peso
+                alvo_id, total = pesos.most_common(1)[0]
+                alvo = self.P[alvo_id]
+                if total >= C.RANCOR_MATA and alvo.estado == VIVO and alvo.loc == L.id and self.r() < 0.12:
+                    motivo = self.motivo_de(p, alvo_id)
+                    self.morrer(alvo, f"assassinado por {self.nm(p)}", L.id)
+                    self.ev("assassinato", L.id, [alvo, p], f"{self.nm(alvo)} aparece {self.g(alvo, 'morto', 'morta')} "
+                            f"em {L.nome}. Todos sabem que foi {self.nm(p)}.", motivo=motivo)
+                    p.rancor = [r for r in p.rancor if r[0] != alvo_id]
+                    if alvo.id == L.lider:
+                        self.novo_lider(L, f"o assassinato de {self.nm(alvo)}")
+            # fome vira roubo
+            if L.fome >= 2:
+                ld_ = self.lider(L)
+                ladroes = [p for p in adultos if p.a["piedade"] <= 3 and p.estado == VIVO and (ld_ is None or p.id != ld_.id)
+                           and p.titulo not in ("Rei", "Rainha")]
+                if ladroes and self.r() < 0.5:
+                    l = self.escolhe(ladroes)
+                    ld = self.lider(L)
+                    pena = "enforcado" if ld and ld.a["crueldade"] >= 7 else "açoitado na praça"
+                    if pena == "enforcado":
+                        self.morrer(l, "enforcado por roubar comida", L.id)
+                        for q in self.parentes(l):
+                            if q.estado == VIVO and q.loc == L.id:
+                                self.guardar_rancor(q, ld, 40, None, f"o enforcamento de {self.relacao(q, l)}, {self.nm(l)}, "
+                                                                     f"por roubar comida com a vila passando fome")
+                    self.ev("roubo", L.id, [l, ld], f"Em {L.nome}, {self.nm(l)} é pego roubando comida do celeiro e é "
+                            f"{pena if pena != 'enforcado' else self.g(l, 'enforcado', 'enforcada')}.",
+                            motivo=f"fome há {L.fome} dias")
+            # desespero vira seita
+            if L.medo >= C.CULTO_DESESPERO and L.seita_lider is None:
+                pregadores = [p for p in adultos if p.a["fe"] >= 8 and p.a["carisma"] >= 7]
+                if pregadores and self.r() < C.SEITA_CHANCE * math.exp(self.flags.get("cultura", {}).get("fe", 0.0)):
+                    pr = self.escolhe(pregadores)
+                    L.seita_lider = pr.id
+                    seg = [p for p in adultos if p.a["fe"] >= 6 and self.r() < 0.5]
+                    for p in seg:
+                        p.seita = True
+                    self.ev("seita", L.id, [pr], f"Em {L.nome}, {self.nm(pr)} começa a pregar que os mortos são castigo "
+                            f"de Deus e que queimar um corpo é pecado. {len(seg)} pessoas passam a segui-{self.g(pr, 'lo', 'la')}.",
+                            motivo="medo e luto depois dos ataques", n=len(seg))
+                    if len(seg) > len(adultos) * 0.35:
+                        L.pol["corpos"] = "velar"
+            L.medo = max(0.0, L.medo - 4)
+
+    def motivo_coletivo(self, L):
+        if L.fome >= 2:
+            return f"fome há {L.fome} dias em {L.nome}"
+        if L.pol["racao"] < 1:
+            return "a ração cortada enquanto a família do líder comia"
+        recusas = [e for e in self.log[-400:] if e["tipo"] == "recusa" and e["lugar"] == L.id]
+        if recusas:
+            return f"o portão fechado para quem fugia ({self.quando(recusas[-1]['h'])})"
+        return "o medo e as mortes sob o comando dele"
+
+    def novo_lider(self, L, porque):
+        adultos = [p for p in self.vivos_em(L.id) if p.estado == VIVO and 18 <= p.idade <= 70 and not p.cela]
+        if not adultos:
+            L.lider = None
+            return
+        nl = max(adultos, key=lambda p: (p.fama or 0) + p.a["carisma"] * 2 + p.a["coragem"] + (6 if p.papel in ("nobre", "rei",
+                                                                                                            "cavaleiro") else 0))
+        L.lider = nl.id
+        self.ev("lider", L.id, [nl], f"{self.nm(nl)} assume o comando de {L.nome}.", motivo=porque)
+
+    def passa_o_fio(self, p):
+        if p.holofote:
+            p.holofote = False
+            for f in self.holofote:
+                if f["id"] == p.id and "ate" not in f:
+                    f["ate"] = self.h
+                    cands = [q for q in self.parentes(p) if q.estado == VIVO] or \
+                            ([self.P[i] for i in sorted(self.H[p.loc])] if p.loc in self.L else [])
+                    cands = [q for q in cands if q.estado == VIVO and not q.holofote and q.idade >= 12]
+                    if cands:
+                        h = max(cands, key=lambda q: ((q.id in (p.filhos or []) or q.id == p.conj) * 50 + (q.fama or 0)))
+                        h.holofote = True
+                        self.holofote.append({"id": h.id, "papel": f"herdeiro do fio de {self.nm(p)}", "desde": self.h,
+                                              "de": p.id})
+        golpe = (p.causa or "").startswith("morto no golpe")
+        monarca = p.papel == "rei" or p.titulo in ("Rei", "Rainha")
+        if (monarca and not golpe and p.loc == "cidadela" and self.L["cidadela"].lider == p.id) or (p.papel == "rei" and not golpe):
+            # só a morte de um rei ou rainha passa a coroa ao filho; quem tomou a cidadela num golpe não funda dinastia,
+            # e quem morre num golpe deixa o comando para o golpista
+            L = self.L["cidadela"]
+            herdeiros = sorted([self.P[i] for i in (p.filhos or []) if self.P[i].estado == VIVO and self.P[i].idade >= 14],
+                               key=lambda q: -q.idade)
+            if herdeiros:
+                L.lider = herdeiros[0].id
+                herdeiros[0].titulo = "Rei" if herdeiros[0].sexo == "m" else "Rainha"
+                self.ev("rei", "cidadela", [herdeiros[0], p], f"Com a morte de {self.nm(p)}, {herdeiros[0].nome} herda a coroa "
+                        f"aos {int(herdeiros[0].idade)} anos.")
+            else:
+                self.novo_lider(L, f"a morte de {self.nm(p)} sem herdeiro")
+
+    # ------------------------------------------------------------------ registro e fim
     def registrar(self):
         vivos = sum(len(s) for s in self.H.values()) + sum(len(g["m"]) for g in self.grupos) + \
             sum(len(s) for s in self.Fora.values())

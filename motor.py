@@ -13,6 +13,7 @@ import numpy as np
 
 import config as C
 import hierarquia as HQ
+import ideias as I
 import mundo as M
 
 VIVO, MORDIDO, ZUMBI, MORTO, DESTRUIDO = "vivo", "mordido", "zumbi", "morto", "destruido"
